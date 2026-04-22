@@ -1,5 +1,43 @@
+import os
+import select
+import threading
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
+
+
+def _exit_on_parent_death() -> None:
+    # macOS kqueue NOTE_EXIT watchdog: if the uv/claude parent dies without
+    # closing our stdin, exit instead of leaking as an init-adopted orphan.
+    initial_ppid = os.getppid()
+    try:
+        kq = select.kqueue()
+        ev = select.kevent(
+            initial_ppid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        kq.control([ev], 0)
+
+        def _wait() -> None:
+            kq.control(None, 1)
+            os._exit(0)
+
+        threading.Thread(target=_wait, daemon=True).start()
+    except OSError:
+        pass
+
+    def _poll() -> None:
+        import time
+        while True:
+            if os.getppid() != initial_ppid or os.getppid() == 1:
+                os._exit(0)
+            time.sleep(2)
+
+    threading.Thread(target=_poll, daemon=True).start()
+
+
+_exit_on_parent_death()
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -10,6 +48,7 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    send_to_contact as whatsapp_send_to_contact,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
@@ -155,11 +194,47 @@ def get_message_context(
     return context
 
 @mcp.tool()
+def send_to_contact(
+    contact_query: str,
+    message: str,
+    include_groups: bool = True,
+) -> Dict[str, Any]:
+    """PREFERRED way to send a WhatsApp message when you only know the recipient
+    by name or phone number. Combines contact lookup + send in a SINGLE tool call
+    (vs the two-call `search_contacts` + `send_message` flow). Use this for any
+    "reply to X", "message Y", "send Z a note" request unless the user already
+    gave you a JID.
+
+    Behaviour:
+    - If contact_query is a JID ("...@s.whatsapp.net" / "...@g.us") or a bare
+      international phone number, sends directly.
+    - If it's a name with a unique match (DM or group chat), sends directly.
+    - If multiple contacts match, does NOT send; returns candidates so you can
+      pick one and call send_message(jid, text) explicitly.
+
+    Args:
+        contact_query: Contact name, phone number (digits only, with country
+            code), or full JID. Partial name matches are accepted when unique.
+        message: The message text to send.
+        include_groups: If True (default), group chats are searchable by name.
+            Set False to restrict to direct-message contacts only.
+
+    Returns:
+        Dict with keys: success (bool), message (status string),
+        resolved_jid (JID actually used, or None if ambiguous),
+        candidates (list of {jid, name, is_group} when ambiguous, else empty).
+    """
+    return whatsapp_send_to_contact(contact_query, message, include_groups)
+
+
+@mcp.tool()
 def send_message(
     recipient: str,
     message: str
 ) -> Dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
+    """Send a WhatsApp message to a person or group when you already know the
+    exact JID or phone number. If you only have a contact name, prefer
+    send_to_contact — it resolves and sends in one call.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,

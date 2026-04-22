@@ -84,6 +84,14 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		-- Perf indices. Without these every list_messages/get_message_context
+		-- call does "SCAN messages + TEMP B-TREE FOR ORDER BY" (full scan + in-memory sort).
+		-- With them the hot queries become INDEX SEEKs (~10-100x speedup on busy DBs).
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
+		CREATE INDEX IF NOT EXISTS idx_chats_last_msg_time ON chats(last_message_time DESC);
 	`)
 	if err != nil {
 		db.Close()
@@ -415,7 +423,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	sender := msg.Info.Sender.User
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, msg.Info.PushName, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -468,6 +476,44 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// RevokeMessageRequest is the body for POST /api/revoke. Revokes (deletes
+// for everyone) a single message previously sent by this bot. WhatsApp only
+// allows revoking your own messages, and usually within a bounded time
+// window (~2 days for regular chats).
+type RevokeMessageRequest struct {
+	Recipient string `json:"recipient"`
+	MessageID string `json:"message_id"`
+}
+
+// RevokeMessageResponse mirrors SendMessageResponse.
+type RevokeMessageResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// revokeWhatsAppMessage revokes a single own-sent message by ID.
+func revokeWhatsAppMessage(client *whatsmeow.Client, recipient, messageID string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	var jid types.JID
+	var err error
+	if strings.Contains(recipient, "@") {
+		jid, err = types.ParseJID(recipient)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing JID: %v", err)
+		}
+	} else {
+		jid = types.JID{User: recipient, Server: "s.whatsapp.net"}
+	}
+	revoke := client.BuildRevoke(jid, types.EmptyJID, messageID)
+	_, err = client.SendMessage(context.Background(), jid, revoke)
+	if err != nil {
+		return false, fmt.Sprintf("Error revoking: %v", err)
+	}
+	return true, fmt.Sprintf("Revoked %s", messageID)
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -641,7 +687,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -723,6 +769,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for revoking (deleting for everyone) a previously-sent message.
+	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req RevokeMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.MessageID == "" {
+			http.Error(w, "recipient and message_id are required", http.StatusBadRequest)
+			return
+		}
+		success, message := revokeWhatsAppMessage(client, req.Recipient, req.MessageID)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(RevokeMessageResponse{Success: success, Message: message})
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -800,14 +869,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -922,13 +991,38 @@ func main() {
 	client.Disconnect()
 }
 
-// GetChatName determines the appropriate name for a chat based on JID and other info
-func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+// looksLikeFakeName returns true when the cached chat name is just the JID
+// digits (the bridge couldn't resolve a real contact name and stored the
+// fallback). When this is the case, GetChatName should re-attempt resolution
+// instead of early-returning the unhelpful digits string.
+func looksLikeFakeName(name string, jid types.JID) bool {
+	if name == "" {
+		return true
+	}
+	if name == jid.User {
+		return true
+	}
+	// All-digits names are LID/phone fallbacks, never real contact names.
+	for _, r := range name {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// GetChatName determines the appropriate name for a chat based on JID and other info.
+// pushName is the WhatsApp display name from the incoming message envelope
+// (msg.Info.PushName) — the most reliable name source for individuals whose
+// JID is `@lid` (privacy id) and therefore unresolvable via Contacts.
+func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, pushName string, logger waLog.Logger) string {
+	// First, check if chat already exists in database with a real name. If
+	// the cached name is just digits (LID fallback) and we now have a push
+	// name, prefer the push name to backfill.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && !looksLikeFakeName(existingName, jid) {
+		// Chat exists with a real name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -973,7 +1067,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,15 +1081,22 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		// Resolution priority for individuals:
+		//   1. Contacts.FullName     — real saved contact (rare for @lid)
+		//   2. Contacts.PushName     — display name they set in their own WA
+		//   3. msg.Info.PushName     — push name from the envelope (caller-supplied)
+		//   4. sender                — likely also LID, used to be the fallback
+		//   5. jid.User              — last resort, raw digits
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
+		} else if err == nil && contact.PushName != "" {
+			name = contact.PushName
+		} else if pushName != "" {
+			name = pushName
 		} else if sender != "" {
-			// Fallback to sender
 			name = sender
 		} else {
-			// Last fallback to JID
 			name = jid.User
 		}
 
@@ -1026,7 +1127,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", "", logger)
 
 		// Process messages
 		messages := conversation.Messages
