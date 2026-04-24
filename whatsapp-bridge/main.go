@@ -211,7 +211,28 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+//
+// 2026-04-24 Fer F. report: WhatsApp's `events.Message` no longer fires for
+// outbound messages sent via `client.SendMessage()` to the user's own
+// self-group (`120363426178035051@g.us` aka RagNet). Server-side change or
+// whatsmeow session drift after a websocket reconnect — historical msgs from
+// the bridge (April 16-23) DID echo back, then stopped. The send itself
+// still works and the user sees the msg on their phone (linked-device sync),
+// but the bridge can't observe its own outgoing traffic, which breaks
+// `messages.db` consistency, `classifyFollowup`, and any downstream
+// observability that joins outbound replies to inbound queries.
+//
+// Workaround: synthetically `StoreMessage(...isFromMe=true)` after a
+// successful `client.SendMessage()` using `resp.ID` + `resp.Timestamp`.
+// PRIMARY KEY (id, chat_jid) + `INSERT OR REPLACE` make this idempotent —
+// if the echo eventually arrives via the regular handler, it just updates
+// the row in place. Sender is filled from `client.Store.ID.User` (the
+// bridge's own phone number), matching what the historical echoes used.
+//
+// Media: we don't synthetic-store binary blobs (URL/MediaKey/SHA256) for
+// outgoing media — the local `mediaPath` is the source of truth; the
+// listener already saved the original. Storing only the caption is fine.
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -370,10 +391,60 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Synthetic-store the outbound message so messages.db stays consistent
+	// even when WhatsApp's events.Message handler doesn't fire back the
+	// echo for our own send (see big comment on this function for context).
+	// Failures here are non-fatal — log and proceed; the send itself
+	// succeeded so the user gets the message regardless.
+	if messageStore != nil && client.Store != nil && client.Store.ID != nil {
+		var storeContent, storeMediaType, storeFilename string
+		if mediaPath != "" {
+			// Caption goes in `content`, type derived from extension. We
+			// skip URL/MediaKey/SHA256 because the synthetic row exists
+			// for observability — the original media is on disk where
+			// the caller put it; the bridge already encrypted/uploaded
+			// the version that hit WhatsApp.
+			storeContent = message
+			fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
+			storeFilename = mediaPath[strings.LastIndex(mediaPath, "/")+1:]
+			switch fileExt {
+			case "jpg", "jpeg", "png", "gif", "webp":
+				storeMediaType = "image"
+			case "ogg", "opus", "mp3", "m4a":
+				storeMediaType = "audio"
+			case "mp4", "avi", "mov":
+				storeMediaType = "video"
+			default:
+				storeMediaType = "document"
+			}
+		} else {
+			storeContent = message
+		}
+
+		ts := resp.Timestamp
+		if ts.IsZero() {
+			ts = time.Now()
+		}
+		storeErr := messageStore.StoreMessage(
+			resp.ID,
+			recipientJID.String(),
+			client.Store.ID.User,
+			storeContent,
+			ts,
+			true, // isFromMe
+			storeMediaType,
+			storeFilename,
+			"", nil, nil, nil, 0, // url + media blobs intentionally empty
+		)
+		if storeErr != nil {
+			fmt.Printf("synthetic-store failed for %s (non-fatal): %v\n", resp.ID, storeErr)
+		}
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -752,7 +823,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
