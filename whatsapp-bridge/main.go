@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -450,6 +451,22 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
+// shaSuffix returns a short, filesystem-safe hex tag derived from the WhatsApp
+// fileSHA256. It exists to avoid filename collisions when two media messages
+// arrive in the same wall-clock second (Go's time.Now().Format("20060102_150405")
+// has second-resolution → forwarded audios sent back-to-back share a filename
+// → the os.Stat() shortcut in downloadMedia() returns the first file for both
+// message IDs, silently dropping the second download). Eight hex chars (32 bits)
+// of the WhatsApp-side SHA256 are unique enough in practice; if SHA256 is
+// missing we fall back to no suffix (preserves prior behaviour for messages
+// without the field).
+func shaSuffix(sha []byte) string {
+	if len(sha) < 4 {
+		return ""
+	}
+	return "_" + hex.EncodeToString(sha[:4])
+}
+
 // Extract media info from a message
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
@@ -458,27 +475,30 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
-			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
+		sha := img.GetFileSHA256()
+		return "image", "image_" + time.Now().Format("20060102_150405") + shaSuffix(sha) + ".jpg",
+			img.GetURL(), img.GetMediaKey(), sha, img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
-			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
+		sha := vid.GetFileSHA256()
+		return "video", "video_" + time.Now().Format("20060102_150405") + shaSuffix(sha) + ".mp4",
+			vid.GetURL(), vid.GetMediaKey(), sha, vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
-			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
+		sha := aud.GetFileSHA256()
+		return "audio", "audio_" + time.Now().Format("20060102_150405") + shaSuffix(sha) + ".ogg",
+			aud.GetURL(), aud.GetMediaKey(), sha, aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
-			filename = "document_" + time.Now().Format("20060102_150405")
+			filename = "document_" + time.Now().Format("20060102_150405") + shaSuffix(doc.GetFileSHA256())
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
