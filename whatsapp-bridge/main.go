@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -814,6 +815,27 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Health probe — used by `rag bridge status` and external monitoring.
+	// Returns the true `client.IsConnected()` state without any side
+	// effects (no fake send attempts that could double-deliver if we
+	// ever pass a real-looking recipient by accident). Always 200; the
+	// caller reads the JSON body to decide if it should warn / re-auth.
+	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Cheap call — IsConnected reads the WebSocket state, no I/O.
+		connected := client.IsConnected()
+		// Logged-in: client has a stored device ID. Even if the socket
+		// dropped momentarily, the session is still valid and reconnect
+		// would succeed without QR. If `Store.ID == nil`, we never
+		// paired (or session was deleted) — re-auth required.
+		loggedIn := client.Store.ID != nil
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"connected": connected,
+			"logged_in": loggedIn,
+			"jid":       func() string { if client.Store.ID != nil { return client.Store.ID.String() }; return "" }(),
+		})
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -1007,9 +1029,55 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			// Clear the reauth sentinel — we're back online. The CLI
+			// (`rag bridge status` / cron jobs) check this file to decide
+			// whether to nag the user. Best-effort; ignore errors (file
+			// may not exist, permission issues, etc.).
+			_ = os.Remove("store/.needs-reauth")
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			// Device logged out remotely — typical reasons: another
+			// linked-device cap, WA server-side session rotation, the
+			// user removed this session from their phone's "Linked
+			// devices" list. The bridge process stays alive (launchd
+			// KeepAlive) but every send returns HTTP 500
+			// "Not connected to WhatsApp" — useless until re-paired.
+			//
+			// What we do here:
+			//   1. Log at ERROR level (not WARN) so it's visible in
+			//      monitoring / `tail -f bridge.log`.
+			//   2. Drop a sentinel file `store/.needs-reauth` with the
+			//      timestamp — `rag bridge status` reads this to surface
+			//      the issue to the user; cleared on next *Connected.
+			//   3. Best-effort macOS notification via osascript so the
+			//      user sees a banner without having to be looking at
+			//      the log. Banner suggests `rag bridge reauth` (the CLI
+			//      command that automates the re-pair flow).
+			//
+			// We deliberately do NOT auto-restart or auto-delete the
+			// session DB — if WA is rejecting our pairing for some
+			// reason (banned account, network issue), restarting in a
+			// loop would just hammer their server. The CLI re-auth
+			// flow is operator-initiated by design.
+			logger.Errorf("Device logged out — run `rag bridge reauth` to re-pair (see: tail -f ~/.local/share/whatsapp-bridge/bridge.log)")
+
+			ts := time.Now().Format(time.RFC3339)
+			if err := os.WriteFile("store/.needs-reauth", []byte(ts+"\n"), 0644); err != nil {
+				logger.Warnf("Failed to write reauth sentinel: %v", err)
+			}
+
+			// Fire-and-forget macOS banner. Runs in goroutine so the
+			// 1-2s osascript spawn doesn't block the event loop. If the
+			// user denied notification permission for "Script Editor"
+			// (the parent of osascript), the call no-ops silently —
+			// nothing we can do from here.
+			go func() {
+				cmd := exec.Command(
+					"osascript", "-e",
+					`display notification "Sesión expirada — corré 'rag bridge reauth' para re-pairear" with title "WhatsApp Bridge" subtitle "Logged out remotely"`,
+				)
+				_ = cmd.Run()
+			}()
 		}
 	})
 
