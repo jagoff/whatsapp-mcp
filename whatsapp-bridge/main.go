@@ -608,6 +608,79 @@ func revokeWhatsAppMessage(client *whatsmeow.Client, recipient, messageID string
 	return true, fmt.Sprintf("Revoked %s", messageID)
 }
 
+// ReactRequest is the body for POST /api/react. Sends an emoji reaction
+// to a specific message in a chat. Used by `whatsapp-listener` to
+// confirm note captures (✅ ok / ⚠️ redacted) without polluting the
+// chat with text replies. Pass `emoji=""` to remove an existing
+// reaction (whatsmeow convention).
+type ReactRequest struct {
+	Recipient string `json:"recipient"`  // chat JID
+	MessageID string `json:"message_id"` // ID of the message to react to
+	SenderJID string `json:"sender_jid"` // JID of the message author (for groups; the message's `Info.Sender`)
+	FromMe    bool   `json:"from_me"`    // whether the reacted-to message was sent by us
+	Emoji     string `json:"emoji"`      // single emoji rune; "" to remove reaction
+}
+
+// ReactResponse mirrors SendMessageResponse.
+type ReactResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// reactToWhatsAppMessage sends a reaction to a message. WhatsApp's reaction
+// protocol requires the chat JID + the message id + the sender JID of the
+// original message + a from_me flag. For messages we sent ourselves
+// (the listener's own draft outputs), `from_me=true` and the sender
+// is our own JID; for incoming messages we want to react to (e.g. the
+// user's note in the Notes chat), `from_me=false` and the sender is
+// the message author.
+func reactToWhatsAppMessage(client *whatsmeow.Client, recipient, messageID, senderJIDStr string, fromMe bool, emoji string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+	chatJID, err := parseJIDOrPhone(recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing chat JID: %v", err)
+	}
+	var senderJID types.JID
+	if senderJIDStr != "" {
+		senderJID, err = types.ParseJID(senderJIDStr)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing sender JID: %v", err)
+		}
+	} else if fromMe {
+		// Default for our own messages: use the client's own JID.
+		if client.Store != nil && client.Store.ID != nil {
+			senderJID = client.Store.ID.ToNonAD()
+		}
+	}
+	reaction := client.BuildReaction(chatJID, senderJID, messageID, emoji)
+	// Set the FromMe flag on the message key. BuildReaction defaults to
+	// `FromMe=false`; we override when reacting to our own messages.
+	if reaction.ReactionMessage != nil && reaction.ReactionMessage.Key != nil {
+		reaction.ReactionMessage.Key.FromMe = proto.Bool(fromMe)
+	}
+	_, err = client.SendMessage(context.Background(), chatJID, reaction)
+	if err != nil {
+		return false, fmt.Sprintf("Error sending reaction: %v", err)
+	}
+	if emoji == "" {
+		return true, fmt.Sprintf("Removed reaction from %s", messageID)
+	}
+	return true, fmt.Sprintf("Reacted %s to %s", emoji, messageID)
+}
+
+// parseJIDOrPhone accepts either a fully-qualified JID
+// (e.g. "5493425153999@s.whatsapp.net" or "120363xxx@g.us") or a bare
+// phone number, and returns the parsed JID. Bare numbers default to
+// the personal-chat server.
+func parseJIDOrPhone(recipient string) (types.JID, error) {
+	if strings.Contains(recipient, "@") {
+		return types.ParseJID(recipient)
+	}
+	return types.JID{User: recipient, Server: "s.whatsapp.net"}, nil
+}
+
 // DownloadMediaRequest represents the request body for the download media API
 type DownloadMediaRequest struct {
 	MessageID string `json:"message_id"`
@@ -903,6 +976,33 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		json.NewEncoder(w).Encode(RevokeMessageResponse{Success: success, Message: message})
+	})
+
+	// POST /api/react — send (or remove) an emoji reaction to a message.
+	// Used by `whatsapp-listener` to confirm note captures with ✅ / ⚠️
+	// without sending a text reply that would pollute the chat.
+	http.HandleFunc("/api/react", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ReactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || req.MessageID == "" {
+			http.Error(w, "recipient and message_id are required", http.StatusBadRequest)
+			return
+		}
+		success, message := reactToWhatsAppMessage(
+			client, req.Recipient, req.MessageID, req.SenderJID, req.FromMe, req.Emoji,
+		)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(ReactResponse{Success: success, Message: message})
 	})
 
 	// Handler for downloading media
