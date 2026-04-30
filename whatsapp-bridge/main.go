@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -447,9 +448,54 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		if storeErr != nil {
 			fmt.Printf("synthetic-store failed for %s (non-fatal): %v\n", resp.ID, storeErr)
 		}
+
+		// Copy the source media into store/<chat>/<filename> so a later
+		// /api/download for this message ID returns the local copy via
+		// the os.Stat() shortcut in downloadMedia(). Without this copy,
+		// /api/download fails with "incomplete media information" because
+		// we intentionally don't persist URL/MediaKey/SHA256 for outgoing
+		// media — but consumers (e.g. the WA listener notes-to-self
+		// capture pipeline) still want to fetch it back to OCR / transcribe
+		// / archive into the Obsidian vault. Failures here are non-fatal;
+		// the send already succeeded.
+		if mediaPath != "" && storeMediaType != "" && storeFilename != "" {
+			chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(recipientJID.String(), ":", "_"))
+			if err := os.MkdirAll(chatDir, 0755); err != nil {
+				fmt.Printf("outgoing media archive: mkdir failed (non-fatal): %v\n", err)
+			} else {
+				targetPath := fmt.Sprintf("%s/%s", chatDir, storeFilename)
+				if err := copyFile(mediaPath, targetPath); err != nil {
+					fmt.Printf("outgoing media archive: copy failed (non-fatal): %v\n", err)
+				}
+			}
+		}
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// copyFile copies a regular file from src to dst, preserving content (not
+// metadata). Used by the outgoing-media archival path so /api/download can
+// serve self-sent media via the local-file shortcut. Skips if dst already
+// exists (idempotent — the bridge can be retriggered safely).
+func copyFile(src, dst string) error {
+	if _, err := os.Stat(dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 // shaSuffix returns a short, filesystem-safe hex tag derived from the WhatsApp
