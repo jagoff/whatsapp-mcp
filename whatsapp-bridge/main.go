@@ -102,6 +102,23 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Migration: add quoted_message_id + quoted_text columns for quote/reply
+	// support. SQLite has no IF NOT EXISTS for ADD COLUMN, so we ignore the
+	// "duplicate column name" error to keep this idempotent across restarts.
+	// The columns let downstream consumers (listener.ts) use the user's
+	// reply text as a calendar/reminder title while the quoted message
+	// supplies the date/time/body — see whatsapp-listener forward-with-comment
+	// flow.
+	for _, alter := range []string{
+		"ALTER TABLE messages ADD COLUMN quoted_message_id TEXT",
+		"ALTER TABLE messages ADD COLUMN quoted_text TEXT",
+	} {
+		if _, e := db.Exec(alter); e != nil && !strings.Contains(e.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("failed migration %q: %v", alter, e)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -119,19 +136,27 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database.
+//
+// `quotedMessageID` + `quotedText` are populated when the message is a
+// reply/quote of a previous text message in the same chat (extracted via
+// `extractQuotedContext`). Both empty for non-reply messages. The
+// listener uses the quoted text as the date/time source while the user's
+// own `content` becomes the calendar/reminder title — see the
+// forward-with-comment flow in whatsapp-listener.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageID, quotedText string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_text)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedMessageID, quotedText,
 	)
 	return err
 }
@@ -199,6 +224,30 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+// Extract the quoted message context if this message is a reply/quote.
+//
+// Returns (quotedID, quotedText). Both empty when the message is not a
+// reply or when the quoted payload is non-text (image/audio/etc — those
+// quotes carry useful metadata but no text we can use as a calendar
+// source). Conversation messages can't carry a quote (only
+// extendedTextMessage exposes contextInfo) so we only check that path.
+func extractQuotedContext(msg *waProto.Message) (string, string) {
+	if msg == nil {
+		return "", ""
+	}
+	ext := msg.GetExtendedTextMessage()
+	if ext == nil {
+		return "", ""
+	}
+	ci := ext.GetContextInfo()
+	if ci == nil {
+		return "", ""
+	}
+	quotedID := ci.GetStanzaID()
+	quotedText := extractTextContent(ci.GetQuotedMessage())
+	return quotedID, quotedText
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -445,6 +494,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			storeMediaType,
 			storeFilename,
 			"", nil, nil, nil, 0, // url + media blobs intentionally empty
+			"", "", // synthetic outbound — we don't track quotes for messages
+			//        we sent ourselves via /api/send (not exposed in API yet).
 		)
 		if storeErr != nil {
 			fmt.Printf("synthetic-store failed for %s (non-fatal): %v\n", resp.ID, storeErr)
@@ -576,6 +627,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
+	// Extract quote/reply context (empty when not a reply, or when quoted
+	// payload is non-text).
+	quotedID, quotedText := extractQuotedContext(msg.Message)
+
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
@@ -596,6 +651,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedID,
+		quotedText,
 	)
 
 	if err != nil {
@@ -1498,6 +1555,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
+				// Quote/reply context (history sync — same shape as live).
+				var quotedID, quotedText string
+				if msg.Message.Message != nil {
+					quotedID, quotedText = extractQuotedContext(msg.Message.Message)
+				}
+
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
@@ -1552,6 +1615,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
+					quotedText,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)

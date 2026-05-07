@@ -1,3 +1,13 @@
 *.db
+*.db-wal
+*.db-shm
+*.db.backup-*
 claude_desktop_config.json
 whatsapp.log
+.DS_Store
+
+# compiled bridge binary
+whatsapp-bridge/whatsapp-bridge
+
+# media + state captured by the bridge — private user data
+whatsapp-bridge/store/
