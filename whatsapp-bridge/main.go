@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -1240,11 +1241,20 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
+		// Print QR code for pairing with phone. Also write the raw code
+		// string to /tmp/whatsapp-qr-code.txt so external tools (`qrencode`)
+		// can render it as PNG when the half-block ASCII version gets clipped
+		// by narrow terminals (≤80 cols).
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				if err := os.WriteFile("/tmp/whatsapp-qr-code.txt", []byte(evt.Code), 0644); err != nil {
+					logger.Warnf("could not write /tmp/whatsapp-qr-code.txt: %v", err)
+				} else {
+					fmt.Println("Raw QR string saved to /tmp/whatsapp-qr-code.txt")
+					fmt.Println("Render PNG: qrencode -o /tmp/whatsapp-qr.png -s 8 < /tmp/whatsapp-qr-code.txt && open /tmp/whatsapp-qr.png")
+				}
 			} else if evt.Event == "success" {
 				connected <- true
 				break
@@ -1279,8 +1289,18 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server. Port is overridable via WHATSAPP_BRIDGE_PORT env
+	// var. Default 8088 (was 8080 historically; moved to 8088 on 2026-05-07
+	// because Caddy holds :8080 as the HTTP redirector — pfctl 80→8080).
+	port := 8088
+	if v := os.Getenv("WHATSAPP_BRIDGE_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 65536 {
+			port = n
+		} else {
+			logger.Warnf("WHATSAPP_BRIDGE_PORT=%q invalid, falling back to %d", v, port)
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
