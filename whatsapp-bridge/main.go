@@ -258,9 +258,57 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient string         `json:"recipient"`
+	Message   string         `json:"message"`
+	MediaPath string         `json:"media_path,omitempty"`
+	ReplyTo   *ReplyToInfo   `json:"reply_to,omitempty"`
+}
+
+// ReplyToInfo carries the quoted-message context so the outgoing message
+// renders with the boxed quote bubble in WhatsApp UI (the "respondiendo a"
+// preview). When omitted, the bridge sends a plain message.
+//
+// MessageID: the bridge's own ID for the quoted message (matches the `id`
+//            column in `messages.db`; whatsmeow's `events.Message.Info.ID`).
+// SenderJID: full JID of who SENT the quoted message (e.g.
+//            "5491234567890@s.whatsapp.net" or "<user>@<group>" for groups).
+//            Required even for 1:1 chats — whatsmeow uses it to construct
+//            the ContextInfo's Participant field.
+// OriginalText: the text content of the quoted message. WhatsApp clients
+//            render this preview locally — the bridge doesn't strictly need
+//            to store it (the receiver's client already has the message)
+//            but including it makes the quote work cross-device when the
+//            receiver hasn't synced the original yet.
+type ReplyToInfo struct {
+	MessageID    string `json:"message_id"`
+	OriginalText string `json:"original_text,omitempty"`
+	SenderJID    string `json:"sender_jid,omitempty"`
+}
+
+// buildContextInfo constructs the whatsmeow ContextInfo struct for a quoted
+// message. Returns nil when ReplyTo is nil or invalid (caller should
+// fall back to plain Conversation).
+//
+// We construct a minimal QuotedMessage containing just Conversation (text)
+// — that's enough for the receiver's client to render the quote bubble
+// preview. WhatsApp's client matches the StanzaID against its local DB to
+// promote the preview to the full quoted message after sync.
+func buildContextInfo(replyTo *ReplyToInfo) *waProto.ContextInfo {
+	if replyTo == nil || strings.TrimSpace(replyTo.MessageID) == "" {
+		return nil
+	}
+	ci := &waProto.ContextInfo{
+		StanzaID: proto.String(replyTo.MessageID),
+	}
+	if strings.TrimSpace(replyTo.SenderJID) != "" {
+		ci.Participant = proto.String(replyTo.SenderJID)
+	}
+	if strings.TrimSpace(replyTo.OriginalText) != "" {
+		ci.QuotedMessage = &waProto.Message{
+			Conversation: proto.String(replyTo.OriginalText),
+		}
+	}
+	return ci
 }
 
 // Function to send a WhatsApp message
@@ -285,7 +333,7 @@ type SendMessageRequest struct {
 // Media: we don't synthetic-store binary blobs (URL/MediaKey/SHA256) for
 // outgoing media — the local `mediaPath` is the source of truth; the
 // listener already saved the original. Storing only the caption is fine.
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo *ReplyToInfo) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -440,7 +488,36 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			}
 		}
 	} else {
-		msg.Conversation = proto.String(message)
+		// Plain text path. If `replyTo` is set, build an ExtendedTextMessage
+		// with ContextInfo so the receiver sees the boxed quote bubble. Else
+		// keep the cheaper Conversation form.
+		ctxInfo := buildContextInfo(replyTo)
+		if ctxInfo != nil {
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: ctxInfo,
+			}
+		} else {
+			msg.Conversation = proto.String(message)
+		}
+	}
+
+	// Media path with reply_to: attach ContextInfo to the appropriate media
+	// message type. WhatsApp protocol allows quoting from media messages too
+	// (each *Message type has its own ContextInfo field).
+	if mediaPath != "" && replyTo != nil {
+		if ctxInfo := buildContextInfo(replyTo); ctxInfo != nil {
+			switch {
+			case msg.ImageMessage != nil:
+				msg.ImageMessage.ContextInfo = ctxInfo
+			case msg.AudioMessage != nil:
+				msg.AudioMessage.ContextInfo = ctxInfo
+			case msg.VideoMessage != nil:
+				msg.VideoMessage.ContextInfo = ctxInfo
+			case msg.DocumentMessage != nil:
+				msg.DocumentMessage.ContextInfo = ctxInfo
+			}
+		}
 	}
 
 	// Send message
@@ -1042,7 +1119,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1107,6 +1184,79 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		json.NewEncoder(w).Encode(ReactResponse{Success: success, Message: message})
+	})
+
+	// POST /api/typing — send "typing..." / "recording..." presence to a chat.
+	// Used by drafting clients (RAG, listener) to show realistic UX cues
+	// while the bot composes a reply: contact sees "escribiendo..." instead
+	// of silence. Body: {recipient: <jid>, state: "composing"|"recording"|"paused"}.
+	// `paused` clears the indicator. Defaults to "composing" if missing.
+	//
+	// WhatsApp auto-clears the indicator after ~10s of no refresh, so the
+	// caller should re-POST every 5-7s while drafting (cheap call, ~1ms).
+	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Recipient string `json:"recipient"`
+			State     string `json:"state,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" {
+			http.Error(w, "recipient is required", http.StatusBadRequest)
+			return
+		}
+		// Map string → whatsmeow ChatPresence + ChatPresenceMedia.
+		// "composing" = text typing, "recording" = audio recording,
+		// "paused" = clear indicator (whatsmeow uses ChatPresencePaused).
+		state := strings.ToLower(strings.TrimSpace(req.State))
+		if state == "" {
+			state = "composing"
+		}
+		var presence types.ChatPresence
+		var media types.ChatPresenceMedia
+		switch state {
+		case "composing", "typing":
+			presence = types.ChatPresenceComposing
+			media = types.ChatPresenceMediaText
+		case "recording":
+			presence = types.ChatPresenceComposing
+			media = types.ChatPresenceMediaAudio
+		case "paused", "stop", "clear":
+			presence = types.ChatPresencePaused
+			media = types.ChatPresenceMediaText
+		default:
+			http.Error(w, fmt.Sprintf("unknown state %q (use composing|recording|paused)", state), http.StatusBadRequest)
+			return
+		}
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]any{
+				"success": false, "message": "not connected to WhatsApp",
+			})
+			return
+		}
+		jid, err := types.ParseJID(req.Recipient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("invalid recipient JID: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := client.SendChatPresence(context.Background(), jid, presence, media); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{
+				"success": false, "message": fmt.Sprintf("send_chat_presence failed: %v", err),
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"success": true, "state": state,
+		})
 	})
 
 	// Handler for downloading media
