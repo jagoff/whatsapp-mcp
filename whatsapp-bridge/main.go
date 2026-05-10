@@ -250,10 +250,18 @@ func extractQuotedContext(msg *waProto.Message) (string, string) {
 	return quotedID, quotedText
 }
 
-// SendMessageResponse represents the response for the send message API
+// SendMessageResponse represents the response for the send message API.
+//
+// MessageID (added 2026-05-10): the WhatsApp stanza ID of the outbound
+// message (`resp.ID` from whatsmeow). The listener uses this to track
+// drafts posted to RagNet by stable ID so that user replies (quote/reply)
+// can be matched back to the originating draft regardless of how many
+// drafts are pending across different contacts. Empty when send failed
+// or when the bridge couldn't resolve the ID.
 type SendMessageResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -333,9 +341,15 @@ func buildContextInfo(replyTo *ReplyToInfo) *waProto.ContextInfo {
 // Media: we don't synthetic-store binary blobs (URL/MediaKey/SHA256) for
 // outgoing media — the local `mediaPath` is the source of truth; the
 // listener already saved the original. Storing only the caption is fine.
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo *ReplyToInfo) (bool, string) {
+// sendWhatsAppMessage returns (success, message, messageID). messageID is
+// the WhatsApp stanza ID of the outbound message (resp.ID from whatsmeow);
+// it is empty when send fails or when whatsmeow doesn't expose it. Callers
+// that need to track the outbound msg by ID (e.g., the listener's RagNet
+// draft → reply matcher added 2026-05-10) should read it from this return
+// and from /api/send response field `message_id`.
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, replyTo *ReplyToInfo) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	// Create JID for recipient
@@ -349,7 +363,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
 		// Create JID from phone number
@@ -366,7 +380,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -415,7 +429,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -445,7 +459,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -524,7 +538,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
 
 	// Synthetic-store the outbound message so messages.db stays consistent
@@ -600,7 +614,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
 }
 
 // copyFile copies a regular file from src to dst, preserving content (not
@@ -1119,8 +1133,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo)
-		fmt.Println("Message sent", success, message)
+		success, message, msgID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.ReplyTo)
+		fmt.Println("Message sent", success, message, "id="+msgID)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -1129,10 +1143,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 
-		// Send response
+		// Send response — message_id added 2026-05-10 so the listener can
+		// track outbound RagNet drafts by stable stanza ID and correlate
+		// user replies (quote/reply) back to the originating draft.
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: msgID,
 		})
 	})
 
