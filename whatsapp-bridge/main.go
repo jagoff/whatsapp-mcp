@@ -119,6 +119,52 @@ func NewMessageStore() (*MessageStore, error) {
 		}
 	}
 
+	// Migration 2026-05-10 — paridad WhatsApp Web (consumido por
+	// `/wa` en obsidian-rag). El bridge solo persistía events.Message;
+	// reactions/revokes/presence inbound se perdían y la UI no podía
+	// mostrarlos. Estas tablas las capturan en SQLite local sin pisar el
+	// schema existente. Todas idempotentes.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS reactions (
+			message_id TEXT NOT NULL,
+			chat_jid TEXT NOT NULL,
+			sender_jid TEXT NOT NULL,
+			emoji TEXT NOT NULL DEFAULT '',
+			ts TIMESTAMP NOT NULL,
+			PRIMARY KEY (message_id, sender_jid)
+		);
+		CREATE INDEX IF NOT EXISTS idx_reactions_chat_ts ON reactions(chat_jid, ts DESC);
+
+		CREATE TABLE IF NOT EXISTS revokes (
+			message_id TEXT PRIMARY KEY,
+			chat_jid TEXT NOT NULL,
+			revoked_by TEXT,
+			ts TIMESTAMP NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_revokes_chat_ts ON revokes(chat_jid, ts DESC);
+
+		CREATE TABLE IF NOT EXISTS presence (
+			chat_jid TEXT NOT NULL,
+			sender_jid TEXT NOT NULL,
+			state TEXT NOT NULL,
+			media TEXT,
+			ts TIMESTAMP NOT NULL,
+			PRIMARY KEY (chat_jid, sender_jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS avatars (
+			jid TEXT PRIMARY KEY,
+			picture_id TEXT,
+			fetched_ts TIMESTAMP NOT NULL,
+			file_path TEXT,
+			full INTEGER NOT NULL DEFAULT 0
+		);
+	`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed reactions/revokes/presence/avatars migration: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -134,6 +180,79 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 		jid, name, lastMessageTime,
 	)
 	return err
+}
+
+// StoreReaction registra (o reemplaza) la reacción de `senderJID` al
+// mensaje `messageID` en `chatJID`. `emoji == ""` significa que el sender
+// removió su reacción — borramos la fila para que un SELECT no devuelva
+// reacciones huérfanas.
+func (store *MessageStore) StoreReaction(messageID, chatJID, senderJID, emoji string, ts time.Time) error {
+	if emoji == "" {
+		_, err := store.db.Exec(
+			"DELETE FROM reactions WHERE message_id = ? AND sender_jid = ?",
+			messageID, senderJID,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		"INSERT INTO reactions (message_id, chat_jid, sender_jid, emoji, ts) VALUES (?, ?, ?, ?, ?) "+
+			"ON CONFLICT(message_id, sender_jid) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts",
+		messageID, chatJID, senderJID, emoji, ts,
+	)
+	return err
+}
+
+// StoreRevoke marca un mensaje como revocado (delete-for-everyone). La fila
+// se inserta una sola vez; futuras revocaciones del mismo ID son no-op.
+func (store *MessageStore) StoreRevoke(messageID, chatJID, revokedBy string, ts time.Time) error {
+	_, err := store.db.Exec(
+		"INSERT OR IGNORE INTO revokes (message_id, chat_jid, revoked_by, ts) VALUES (?, ?, ?, ?)",
+		messageID, chatJID, revokedBy, ts,
+	)
+	return err
+}
+
+// StorePresence persiste el último estado de typing por (chat, sender).
+// La fila se sobreescribe — solo nos interesa el estado actual.
+func (store *MessageStore) StorePresence(chatJID, senderJID, state, media string, ts time.Time) error {
+	_, err := store.db.Exec(
+		"INSERT INTO presence (chat_jid, sender_jid, state, media, ts) VALUES (?, ?, ?, ?, ?) "+
+			"ON CONFLICT(chat_jid, sender_jid) DO UPDATE SET state = excluded.state, media = excluded.media, ts = excluded.ts",
+		chatJID, senderJID, state, media, ts,
+	)
+	return err
+}
+
+// StoreAvatar registra (o actualiza) el path local de la foto de perfil
+// cacheada para un JID. `full = 1` para foto full-res, 0 para preview.
+func (store *MessageStore) StoreAvatar(jid, pictureID, filePath string, full bool, fetchedTS time.Time) error {
+	fullInt := 0
+	if full {
+		fullInt = 1
+	}
+	_, err := store.db.Exec(
+		"INSERT INTO avatars (jid, picture_id, fetched_ts, file_path, full) VALUES (?, ?, ?, ?, ?) "+
+			"ON CONFLICT(jid) DO UPDATE SET picture_id = excluded.picture_id, fetched_ts = excluded.fetched_ts, file_path = excluded.file_path, full = excluded.full",
+		jid, pictureID, fetchedTS, filePath, fullInt,
+	)
+	return err
+}
+
+// LookupAvatar devuelve el path local cacheado para un JID. Devuelve
+// strings vacíos + zero time si no hay cache (el caller decide si
+// re-fetchear contra WhatsApp).
+func (store *MessageStore) LookupAvatar(jid string) (filePath, pictureID string, fetchedTS time.Time, full bool, err error) {
+	var fullInt int
+	row := store.db.QueryRow(
+		"SELECT file_path, COALESCE(picture_id, ''), fetched_ts, full FROM avatars WHERE jid = ?",
+		jid,
+	)
+	err = row.Scan(&filePath, &pictureID, &fetchedTS, &fullInt)
+	if err == sql.ErrNoRows {
+		return "", "", time.Time{}, false, nil
+	}
+	full = fullInt != 0
+	return
 }
 
 // Store a message in the database.
@@ -702,6 +821,50 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+
+	// Reactions y revokes inbound vienen wrappeados dentro del mismo
+	// events.Message (no son tipos separados en whatsmeow). Detectarlos
+	// y persistirlos en sus tablas dedicadas antes del path normal de
+	// StoreMessage — el evento "es" la reacción/revoke, no un mensaje
+	// regular que debamos guardar en `messages`. Consumido por `/wa`
+	// en obsidian-rag.
+	if react := msg.Message.GetReactionMessage(); react != nil {
+		if key := react.GetKey(); key != nil {
+			targetID := key.GetID()
+			// Reactions a mensajes propios traen Participant vacío;
+			// el chat JID del target coincide con el chat actual.
+			targetChat := key.GetRemoteJID()
+			if targetChat == "" {
+				targetChat = chatJID
+			}
+			senderJID := msg.Info.Sender.String()
+			if err := messageStore.StoreReaction(targetID, targetChat, senderJID, react.GetText(), msg.Info.Timestamp); err != nil {
+				logger.Warnf("Failed to store reaction: %v", err)
+			} else {
+				fmt.Printf("[%s] ⟲ %s reaccionó a %s con %q\n",
+					msg.Info.Timestamp.Format("2006-01-02 15:04:05"),
+					sender, targetID, react.GetText())
+			}
+		}
+		return
+	}
+	if proto := msg.Message.GetProtocolMessage(); proto != nil && proto.GetType() == waProto.ProtocolMessage_REVOKE {
+		if key := proto.GetKey(); key != nil {
+			targetID := key.GetID()
+			targetChat := key.GetRemoteJID()
+			if targetChat == "" {
+				targetChat = chatJID
+			}
+			if err := messageStore.StoreRevoke(targetID, targetChat, msg.Info.Sender.String(), msg.Info.Timestamp); err != nil {
+				logger.Warnf("Failed to store revoke: %v", err)
+			} else {
+				fmt.Printf("[%s] ✗ %s revocó %s\n",
+					msg.Info.Timestamp.Format("2006-01-02 15:04:05"),
+					sender, targetID)
+			}
+		}
+		return
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, msg.Info.PushName, logger)
@@ -1327,6 +1490,106 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// GET /api/avatar?jid=...[&size=preview|full][&refresh=1]
+	// Devuelve la foto de perfil del JID como image/jpeg. Cache local en
+	// `store/avatars/<jid-sanitized>.<sha-preview-or-full>.jpg`,
+	// re-fetched si `now - fetched_ts > 7d` o si pasa `?refresh=1`. Si
+	// WhatsApp no tiene foto pública (privacy lockdown) devuelve 404.
+	http.HandleFunc("/api/avatar", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jidStr := r.URL.Query().Get("jid")
+		if jidStr == "" {
+			http.Error(w, "jid query param is required", http.StatusBadRequest)
+			return
+		}
+		full := r.URL.Query().Get("size") == "full"
+		refresh := r.URL.Query().Get("refresh") == "1"
+
+		// 1) Check cache
+		cachedPath, _, cachedTS, cachedFull, err := messageStore.LookupAvatar(jidStr)
+		if err != nil {
+			fmt.Printf("avatar cache lookup failed for %s: %v\n", jidStr, err)
+		}
+		cacheHit := cachedPath != "" && cachedFull == full && time.Since(cachedTS) < 7*24*time.Hour && !refresh
+		if cacheHit {
+			if _, statErr := os.Stat(cachedPath); statErr == nil {
+				w.Header().Set("Cache-Control", "private, max-age=604800")
+				http.ServeFile(w, r, cachedPath)
+				return
+			}
+			// Si el archivo desapareció, caemos al re-fetch.
+		}
+
+		// 2) Fetch fresh URL via whatsmeow
+		jid, parseErr := types.ParseJID(jidStr)
+		if parseErr != nil {
+			http.Error(w, fmt.Sprintf("invalid jid: %v", parseErr), http.StatusBadRequest)
+			return
+		}
+		info, fetchErr := client.GetProfilePictureInfo(context.Background(), jid, &whatsmeow.GetProfilePictureParams{Preview: !full})
+		if fetchErr != nil || info == nil || info.URL == "" {
+			// El usuario puede no tener foto pública. Marcamos 404 y
+			// dejamos que la UI caiga al fallback de iniciales.
+			http.NotFound(w, r)
+			return
+		}
+
+		// 3) Download URL → disk
+		if err := os.MkdirAll("store/avatars", 0755); err != nil {
+			fmt.Printf("mkdir avatars: %v\n", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		dlReq, _ := http.NewRequest("GET", info.URL, nil)
+		dlResp, dlErr := http.DefaultClient.Do(dlReq)
+		if dlErr != nil {
+			fmt.Printf("avatar download failed: %v\n", dlErr)
+			http.Error(w, "fetch failed", http.StatusBadGateway)
+			return
+		}
+		defer dlResp.Body.Close()
+		if dlResp.StatusCode >= 400 {
+			http.NotFound(w, r)
+			return
+		}
+		// Sanitize JID for filename ("@" and ":" no son safe en algunos FS).
+		safeJID := strings.NewReplacer("@", "_at_", ":", "_", "/", "_").Replace(jidStr)
+		sizeTag := "preview"
+		if full {
+			sizeTag = "full"
+		}
+		outPath := fmt.Sprintf("store/avatars/%s.%s.%s.jpg", safeJID, info.ID, sizeTag)
+		outFile, createErr := os.Create(outPath)
+		if createErr != nil {
+			fmt.Printf("avatar create file: %v\n", createErr)
+			http.Error(w, "write failed", http.StatusInternalServerError)
+			return
+		}
+		if _, copyErr := io.Copy(outFile, dlResp.Body); copyErr != nil {
+			outFile.Close()
+			os.Remove(outPath)
+			http.Error(w, "write failed", http.StatusInternalServerError)
+			return
+		}
+		outFile.Close()
+
+		// 4) Update cache row
+		if err := messageStore.StoreAvatar(jidStr, info.ID, outPath, full, time.Now()); err != nil {
+			fmt.Printf("StoreAvatar: %v\n", err)
+		}
+
+		// 5) Borrar archivo viejo si el ID cambió (mantiene store/avatars limpio)
+		if cachedPath != "" && cachedPath != outPath {
+			_ = os.Remove(cachedPath)
+		}
+
+		w.Header().Set("Cache-Control", "private, max-age=604800")
+		http.ServeFile(w, r, outPath)
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -1393,6 +1656,20 @@ func main() {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
+
+		case *events.ChatPresence:
+			// Typing/recording presence updates de contactos. State es
+			// "composing" o "paused"; Media puede ser "audio" cuando el
+			// otro lado está grabando un PTT. La fila se sobreescribe
+			// porque solo importa el último estado. Consumido por `/wa`
+			// vía poll de la tabla `presence`.
+			chatJID := v.Chat.String()
+			senderJID := v.Sender.String()
+			state := string(v.State)
+			media := string(v.Media)
+			if err := messageStore.StorePresence(chatJID, senderJID, state, media, time.Now()); err != nil {
+				logger.Warnf("Failed to store presence: %v", err)
+			}
 
 		case *events.HistorySync:
 			// Process history sync events
